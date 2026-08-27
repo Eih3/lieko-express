@@ -1,9 +1,9 @@
 {
   "name": "lieko-express",
-  "version": "1.0.1",
+  "version": "1.1.0",
   "repository": {
     "type": "git",
-    "url": "https://github.com/Eih3/lieko-express"
+    "url": "git+https://github.com/Eih3/lieko-express.git"
   },
   "homepage": "https://github.com/Eih3/lieko-express",
   "description": "Lieko-express — A Modern, Minimal, express-like Framework for Node.js",
