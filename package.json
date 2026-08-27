@@ -1,0 +1,24 @@
+{
+  "name": "lieko-express",
+  "version": "1.0.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Eih3/lieko-express"
+  },
+  "homepage": "https://github.com/Eih3/lieko-express",
+  "description": "Lieko-express — A Modern, Minimal, express-like Framework for Node.js",
+  "main": "lieko-express.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "Eih3 eih3.prog@gmail.com",
+  "license": "ISC",
+  "type": "commonjs",
+  "files": [
+    "lieko-express.js",
+    "README.md",
+    "helpers",
+    "lib"
+  ]
+}
