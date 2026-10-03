@@ -7,6 +7,18 @@ const path = require("path");
 
 const { getMimeType } = require('./helpers/mimes');
 
+const { STATUS_CODES } = require('http');
+const ERROR_CODES = require('./lib/error-codes');
+
+const ERROR_STATUS_BY_CODE = {};
+const ERROR_CODE_BY_STATUS = {};
+for (const [key, { status }] of Object.entries(ERROR_CODES)) {
+  ERROR_STATUS_BY_CODE[key] = status;
+  if (!(status in ERROR_CODE_BY_STATUS)) ERROR_CODE_BY_STATUS[status] = key;
+}
+
+const ERROR_RESERVED_KEYS = new Set(['status', 'code', 'message', 'details', 'expose', 'meta']);
+
 const {
   Schema,
   ValidationError,
@@ -840,13 +852,7 @@ ${cyan}    (req, res, next) => {
     if (this.errorHandlers.length === 0) {
       console.error("\n🔥 INTERNAL ERROR");
       console.error(err.stack || err);
-      return res.status(500).json({
-        error: {
-          message: "Internal Server Error",
-          status: 500,
-          type: "InternalServerError"
-        }
-      });
+      return res.error(ERROR_CODES.INTERNAL_ERROR);
     }
 
     let index = 0;
@@ -872,58 +878,12 @@ ${cyan}    (req, res, next) => {
     } catch (e) {
       console.error("\n🔥 ERROR INSIDE ERROR HANDLER");
       console.error(e.stack || e);
-      res.status(500).json({
-        error: {
-          message: "Internal Server Error",
-          status: 500
-        }
-      });
+      res.error(ERROR_CODES.INTERNAL_ERROR);
     }
   }
 
-  error(res, errorObj) {
-    if (typeof errorObj === "string") {
-      errorObj = { message: errorObj };
-    }
-
-    if (!errorObj || typeof errorObj !== "object") {
-      return res.status(500).json({
-        error: {
-          message: "Invalid error format passed to res.error()",
-          status: 500
-        }
-      });
-    }
-
-    const HTTP_STATUS = {
-      INVALID_REQUEST: 400,
-      VALIDATION_FAILED: 400,
-      NO_TOKEN_PROVIDED: 401,
-      INVALID_TOKEN: 401,
-      FORBIDDEN: 403,
-      NOT_FOUND: 404,
-      METHOD_NOT_ALLOWED: 405,
-      CONFLICT: 409,
-      RECORD_EXISTS: 409,
-      TOO_MANY_REQUESTS: 429,
-      SERVER_ERROR: 500,
-      SERVICE_UNAVAILABLE: 503
-    };
-
-    let currentStatus = res.statusCode || 200;
-    let desiredStatus = errorObj.status || HTTP_STATUS[errorObj.status];
-
-    const finalStatus = (currentStatus >= 400 && currentStatus < 600)
-      ? currentStatus
-      : (desiredStatus || 500);
-
-    return res.status(finalStatus).json({
-      error: {
-        message: errorObj.message || 'An error occurred',
-        status: errorObj.status || finalStatus,
-        ...errorObj
-      }
-    });
+  error(res, errorObj, overrides) {
+    return res.error(errorObj, overrides);
   }
 
   #parseIp(rawIp) {
@@ -1019,20 +979,10 @@ ${cyan}    (req, res, next) => {
         await this.#parseBody(req, route ? route.bodyParserOptions : null);
       } catch (error) {
         if (error.code === 'PAYLOAD_TOO_LARGE') {
-          return res.status(413).json({
-            error: {
-              message: 'Payload Too Large',
-              status: 413
-            }
-          });
+          return res.error(ERROR_CODES.PAYLOAD_TOO_LARGE);
         }
         if (error.code === 'INVALID_JSON') {
-          return res.status(400).json({
-            error: {
-              message: error.message,
-              status: 400
-            }
-          });
+          return res.error(ERROR_CODES.INVALID_JSON, { message: error.message });
         }
         return await this.#runErrorHandlers(error, req, res);
       }
@@ -1097,7 +1047,7 @@ ${cyan}    (req, res, next) => {
 
       if (!route) {
         if (this.notFoundHandler) return this.notFoundHandler(req, res);
-        return res.status(404).error('Not Found');
+        return res.error(ERROR_CODES.NOT_FOUND);
       }
 
       req.params = route.params;
@@ -1689,73 +1639,112 @@ ${cyan}    (req, res, next) => {
       return res.end(html);
     };
 
-    res.ok = (data, message) => {
-      if (!res.statusCode || res.statusCode === 200) {
-        res.status(200);
+    const buildEnvelope = (success, payload, status, meta) => {
+      const extra = meta && typeof meta === 'object' ? meta : {};
+      const body = { success, ...payload };
+
+      if (!success) body.meta = { timestamp: new Date().toISOString(), ...extra };
+      else if (Object.keys(extra).length > 0) body.meta = extra;
+
+      return res.status(status).json(body);
+    };
+
+    const isHttpError = (n) => Number.isInteger(n) && n >= 400 && n <= 599;
+
+    res.success = (data = null, overrides = {}) => {
+      const { status = 200, meta } = overrides || {};
+      return buildEnvelope(true, { data }, status, meta);
+    };
+
+    res.error = (e = {}, overrides = {}) => {
+      const isNativeError = e instanceof Error;
+      const extras = {};
+
+      if (typeof e === 'string') e = { message: e };
+      else if (Array.isArray(e)) e = { details: e };
+      else if (isNativeError) {
+        e = {
+          message: e.message,
+          code: typeof e.code === 'string' ? e.code : undefined,
+          status: e.status ?? e.statusCode,
+          details: e.details,
+          expose: e.expose
+        };
+      } else if (!e || typeof e !== 'object') {
+        e = {};
+      } else {
+        for (const [k, v] of Object.entries(e)) {
+          if (v !== undefined && !ERROR_RESERVED_KEYS.has(k)) extras[k] = v;
+        }
       }
-      const payload = { data };
-      if (message !== undefined) payload.message = message;
-      return res.json(payload);
-    };
 
-    res.created = (data, message = 'Resource created successfully') => {
-      return res.status(201).json({ data, message });
-    };
+      overrides = overrides || {};
+      const pick = (k) => overrides[k] !== undefined ? overrides[k] : e[k];
 
-    res.noContent = () => {
-      return res.status(204).end();
-    };
+      const status =
+        [pick('status'), res.statusCode].find(isHttpError) ??
+        ERROR_STATUS_BY_CODE[pick('code')] ??
+        500;
+      const hide = isNativeError && status >= 500 && e.expose !== true;
 
-    res.accepted = (data = null, message = 'Request accepted') => {
-      return res.status(202).json({ data, message });
+      const code = (hide ? overrides.code : pick('code')) ?? ERROR_CODE_BY_STATUS[status] ?? 'INTERNAL_ERROR';
+      const message = (hide ? overrides.message : pick('message'))
+        || ERROR_CODES[code]?.message
+        || STATUS_CODES[status]
+        || 'Internal server error';
+
+      const error = { status, code, message };
+
+      let details = hide ? overrides.details : pick('details');
+      if (Object.keys(extras).length > 0) {
+        if (details === undefined || details === null) details = extras;
+        else if (typeof details === 'object' && !Array.isArray(details)) details = { ...details, ...extras };
+      }
+      if (details && (Array.isArray(details) ? details.length > 0 : Object.keys(details).length > 0)) {
+        error.details = details;
+      }
+
+      return buildEnvelope(false, { error }, status, pick('meta'));
     };
+    res.fail = res.error;
+    res.ERROR_CODES = ERROR_CODES;
+
+    const withMessage = (o, message) =>
+      message === undefined ? o : { ...o, meta: { message, ...(o && o.meta) } };
+
+    res.ok = (data, message) => res.success(data, withMessage({}, message));
+    res.created = (data, message = 'Resource created successfully') =>
+      res.success(data, withMessage({ status: 201 }, message));
+    res.accepted = (data = null, message = 'Request accepted') =>
+      res.success(data, withMessage({ status: 202 }, message));
 
     res.paginated = (items, total, message = 'Data retrieved successfully') => {
       const page = Math.max(1, Number(req.query.page) || 1);
       const limit = Math.min(100, Math.max(1, Number(req.query.limit) || 10));
       const totalPages = Math.ceil(total / limit);
 
-      return res.status(200).json({
-        data: items,
-        message,
-        pagination: {
-          page,
-          limit,
-          total,
-          totalPages,
-          hasNext: page < totalPages,
-          hasPrev: page > 1
+      return res.success(items, {
+        meta: {
+          message,
+          pagination: { page, limit, total, totalPages, hasNext: page < totalPages, hasPrev: page > 1 }
         }
       });
     };
+
+    res.noContent = () => {
+      return res.status(204).end();
+    };
+
+    res.badRequest = (e, o) => res.error(e, { ...o, status: 400 });
+    res.unauthorized = (e, o) => res.error(e, { ...o, status: 401 });
+    res.forbidden = (e, o) => res.error(e, { ...o, status: 403 });
+    res.notFound = (e, o) => res.error(e, { ...o, status: 404 });
+    res.serverError = (e, o) => res.error(e, { ...o, status: 500 });
 
     res.redirect = (url, status = 302) => {
       responseSent = true;
       res.writeHead(status, { Location: url });
       res.end();
-    };
-
-    res.error = (obj) => this.error(res, obj);
-    res.fail = res.error;
-
-    res.badRequest = function (msg = "BAD_REQUEST") {
-      return res.status(400).error(msg);
-    };
-
-    res.unauthorized = function (msg = "UNAUTHORIZED") {
-      return res.status(401).error(msg);
-    };
-
-    res.forbidden = function (msg = "FORBIDDEN") {
-      return res.status(403).error(msg);
-    };
-
-    res.notFound = function (msg = "NOT_FOUND") {
-      return res.status(404).error(msg);
-    };
-
-    res.serverError = function (msg = "SERVER_ERROR") {
-      return res.status(500).error(msg);
     };
 
     res.cookie = (name, value, options = {}) => {
@@ -1962,47 +1951,7 @@ ${cyan}    (req, res, next) => {
   }
 
   printRoutes() {
-    setImmediate(() => {
-      if (this.routes.length === 0) {
-        console.log('\nNo routes registered.\n');
-        return;
-      }
-
-      console.log(`\nRegistered Routes: ${this.routes.length}\n`);
-
-      const grouped = new Map();
-
-      for (const route of this.routes) {
-        const key = `${route.method}|${route.handler}`;
-        if (!grouped.has(key)) {
-          grouped.set(key, {
-            method: route.method,
-            paths: [],
-            mw: route.middlewares.length
-          });
-        }
-        const entry = grouped.get(key);
-        const p = route.path || '/';
-        if (!entry.paths.includes(p)) {
-          entry.paths.push(p);
-        }
-      }
-
-      const sorted = Array.from(grouped.values()).sort((a, b) => {
-        if (a.method !== b.method) return a.method.localeCompare(b.method);
-        return a.paths[0].localeCompare(b.paths[0]);
-      });
-
-      for (const r of sorted) {
-        const pathStr = r.paths.length === 1
-          ? r.paths[0]
-          : r.paths.join(', ');
-
-        console.log(` \x1b[36m${r.method.padEnd(7)}\x1b[0m \x1b[33m${pathStr}\x1b[0m \x1b[90m(mw: ${r.mw})\x1b[0m`);
-      }
-    });
-
-    return this;
+    return console.table(this.listRoutes());
   }
 
   get handler() {
@@ -2034,6 +1983,7 @@ function Session() {
 module.exports = Lieko;
 module.exports.Router = Router;
 module.exports.Session = Session;
+module.exports.ERROR_CODES = ERROR_CODES;
 
 module.exports.Schema = Schema;
 module.exports.createSchema = (...args) => new Schema(...args);
